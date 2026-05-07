@@ -64,7 +64,7 @@ def create_access_token(subject: str, expires_delta: timedelta | None = None) ->
         "exp": expire,
     }
 
-    return jwt.encode(payload, settings.SECRET_KEY, algorithm=ALGORITHM)
+    return jwt.encode(payload, settings.secret_key, algorithm=ALGORITHM)
 
 
 def decode_access_token(token: str) -> dict[str, Any] | None:
@@ -76,7 +76,7 @@ def decode_access_token(token: str) -> dict[str, Any] | None:
     settings = get_settings()
 
     try:
-        return jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
+        return jwt.decode(token, settings.secret_key, algorithms=[ALGORITHM])
     except JWTError:
         return None
 
@@ -93,11 +93,11 @@ def configure_cors(app: FastAPI, origins: list[str] | None = None) -> None:
     """
 
     settings = get_settings()
-    allowed_origins = origins if origins is not None else settings.CORS_ORIGINS
+    allowed_origins = origins if origins is not None else settings.effective_cors_origins
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=allowed_origins,
+        allow_origins=["http://localhost:5173"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
