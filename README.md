@@ -1,6 +1,6 @@
 Multimodal AI for Pre-TIA Detection
 
-[Stroke Shield Demo](link-to-demo-video-or-gif)
+[Stroke Shield Demo](https://youtu.be/-seCH_FrJxw)
 
 Stroke Shield is an AI-powered prototype system designed to assess stroke risk by analyzing three key data streams:
 
