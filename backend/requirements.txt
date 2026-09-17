@@ -1,0 +1,66 @@
+# ============================================================
+# Multimodal Pre-TIA Screening System — Requirements
+# Python 3.11+
+# ============================================================
+
+
+# ── Web framework ─────────────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.29.0        # ASGI server
+python-multipart==0.0.9          # file upload support (UploadFile)
+
+
+# ── Configuration & environment ───────────────────────────────
+pydantic==2.7.1
+pydantic-settings==2.2.1         # BaseSettings for config.py
+python-dotenv==1.0.1             # .env file loading
+
+
+# ── Signal processing ─────────────────────────────────────────
+numpy==1.26.4                  # array operations, signal processing
+scipy==1.11.4                    # butter, sosfiltfilt, iirnotch, filtfilt
+pandas==2.2.2                    # CSV ingestion
+
+
+# ── Biosignal datasets (PhysioNet) ────────────────────────────
+wfdb==4.1.2                      # MIT-BIH AF + MIMIC PERform loading
+
+
+# ── Machine learning ──────────────────────────────────────────
+tensorflow==2.16.1               # 1D CNN (FR2)
+scikit-learn==1.4.2              # IsolationForest, StandardScaler (FR3)
+
+
+# ── Audio / voice analysis ────────────────────────────────────
+librosa==0.10.2                  # MFCC, pyin F0, spectral features (FR3)
+soundfile==0.12.1                # WAV file I/O (librosa backend)
+
+
+# ── Computer vision / face analysis ──────────────────────────
+mediapipe==0.10.14               # Face Mesh 468 landmarks (FR3)
+opencv-python-headless==4.9.0.80 # Frame decoding — headless (no GUI)
+
+
+# ── Utilities ─────────────────────────────────────────────────
+python-jose[cryptography]==3.3.0 # JWT for auth router
+passlib[bcrypt]==1.7.4           # password hashing for auth
+httpx==0.27.0                    # async HTTP client (testing)
+aiofiles==23.2.1                 # async file I/O
+
+
+# ── Database ──────────────────────────────────────────────────
+sqlalchemy==2.0.30               # ORM (prototype)
+aiosqlite==0.20.0                # async SQLite driver
+asyncpg==0.29.0                  # async PostgreSQL driver (production)
+alembic==1.13.1                  # database migrations
+
+
+# ── Testing ───────────────────────────────────────────────────
+pytest==8.2.0
+pytest-asyncio==0.23.6
+httpx==0.27.0                    # TestClient for FastAPI
+
+
+# ── Dev / linting ─────────────────────────────────────────────
+black==24.4.2
+ruff==0.4.4

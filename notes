@@ -1,0 +1,1665 @@
+schema.py
+from __future__ import annotations
+This allows modern type hints (like list[float]) without issues across Python versions.
+
+from datetime import datetime
+Used for timestamps in status responses.
+
+from typing import Optional
+Used to say a field can be missing or None.
+
+from pydantic import BaseModel, Field
+BaseModel is the base class for all Pydantic models. Field adds descriptions and defaults.
+
+Soft enums:
+SignalType = str
+SignalSource = str
+RhythmLabel = str
+AlertTier = str
+These are intentionally just strings so any value is accepted. The docstrings under each one list the “canonical” values your system expects, but they don’t block new strings.
+
+class SignalUploadRequest(BaseModel)
+Represents metadata when a user uploads a signal file.
+Fields:
+
+signal_type: which kind of signal (ECG, PPG, or any custom string).
+signal_source: where it came from (MIT_BIH_AF, REAL_TIME, etc.).
+filename: optional original filename.
+sample_rate_hz: optional sampling rate.
+duration_seconds: optional duration.
+metadata: optional key/value info from client.
+class SegmentSchema(BaseModel)
+Represents one processed segment of signal data.
+Fields:
+
+hrv_rmssd: variability metric.
+hrv_sdnn: another variability metric.
+rr_irregularity: irregularity measure.
+samples: raw samples for the segment.
+class FilteredSignalResponse(BaseModel)
+Represents a filtered signal response returned by the backend.
+Fields:
+
+signal_type: which kind of signal.
+signal_source: where it came from.
+filtered_samples: list of filtered values.
+segment: optional SegmentSchema with metrics.
+metadata: optional extra info.
+class SignalStatusResponse(BaseModel)
+Represents system status.
+Fields:
+
+status: string like "ok" or "error".
+message: optional details.
+timestamp: time the status was generated.
+class FaceFeatures(BaseModel)
+Represents face asymmetry scores as a flexible map.
+Fields:
+
+scores: dict of feature name to score.
+class FaceAnalysisResult(BaseModel)
+Represents a face analysis outcome.
+Fields:
+
+features: a FaceFeatures object.
+aggregated_score: overall asymmetry score.
+class DysarthriaFeatures(BaseModel)
+Represents dysarthria features from TORGO.
+Fields:
+
+scores: dict of feature name to score.
+class ParkinsonsFeatures(BaseModel)
+Represents Parkinsons features from UCI.
+Fields:
+
+scores: dict of feature name to score.
+class VoiceFeatures(BaseModel)
+Represents a union of voice feature sets.
+Fields:
+
+dysarthria: optional DysarthriaFeatures.
+parkinsons: optional ParkinsonsFeatures.
+class VoiceAnalysisResult(BaseModel)
+Represents overall voice analysis.
+Fields:
+
+features: a VoiceFeatures bundle.
+scores: aggregate scores as a dict.
+class AnomalyResult(BaseModel)
+Represents anomaly detection output.
+Fields:
+
+score: anomaly score.
+confidence: confidence in the score.
+contributing_features: dict of feature weights.
+class FusionResult(BaseModel)
+Represents fused multi‑modal risk output.
+Fields:
+
+risk_score: numeric risk (0–100).
+alert_tier: string tier (open‑ended).
+confidence: confidence value.
+contributing_factors: dict of factor weights.
+recommendation: human‑readable recommendation.
+Tests added
+I added c:\Users\dell\Desktop\fyp\real_fyp\stroke-shield\backend\tests\test_schemas.py to validate:
+
+Arbitrary string values are accepted for “enums.”
+Segment metrics accept numeric values and samples.
+FusionResult serializes correctly.
+I didn’t run tests because dependencies are likely not installed here. If you want, I can run pytest after installing requirements.
+
+bandpass filter.py
+numpy and scipy
+Imports
+dataclass and Iterable: used for a small config structure and to accept any list‑like signal input.
+numpy: turns the signal into a clean numeric array and handles NaNs.
+scipy.signal functions:
+butter: designs the Butterworth filter.
+sosfiltfilt: applies the filter in forward+reverse (zero‑phase).
+iirnotch + filtfilt: makes and applies the 60 Hz notch.
+BandpassFilterConfig
+A small immutable config holder for filter settings. It’s optional but useful if you want to pass settings as a single object later.
+
+BandpassFilter.design_butterworth(...)
+Converts the low/high cut into normalized frequencies based on Nyquist (half the sampling rate).
+Returns filter coefficients in SOS (second‑order sections), which are numerically stable.
+BandpassFilter.apply(...)
+This is the main entry point.
+
+Convert input to a float array.
+If empty, return immediately.
+Replace NaN values with interpolated values so filtering doesn’t break.
+Design Butterworth bandpass and apply sosfiltfilt (zero‑phase filtering).
+If notch_freq is valid (not above Nyquist), apply a 60 Hz notch.
+Return the filtered signal.
+apply_ecg(...)
+Convenience wrapper for ECG defaults:
+
+0.5–40 Hz bandpass at 250 Hz.
+apply_ppg(...)
+Convenience wrapper for PPG defaults:
+
+0.5–8 Hz bandpass at 125 Hz.
+_safe_sosfiltfilt(...) and _safe_filtfilt(...)
+filtfilt requires the signal length to be longer than a padding length. If it’s too short, we reflect‑pad the signal first so filtering still works.
+
+_reflect_pad(...)
+Reflect‑pads the signal to satisfy the minimum length requirement.
+
+_fill_nans(...)
+If NaNs exist:
+
+If all values are NaN, return zeros.
+Otherwise, linearly interpolate missing values.
+Why this matches your spec
+Bandpass + notch: exactly as specified.
+Zero‑phase filtering: uses sosfiltfilt.
+Edge cases: handles short signals and NaNs.
+ECG/PPG configs: hardcoded helpers for the exact ranges you gave.
+
+File: backend/app/services/ingestion.py
+Imports
+dataclass, Optional
+Used to define a simple data container and allow optional fields like patient_id.
+BytesIO
+Lets pandas read a CSV from raw bytes (file upload).
+numpy as np
+Used for numeric arrays and timestamp generation.
+pandas as pd
+Used to parse CSV files and fill missing values.
+wfdb
+Reads MIT‑BIH and MIMIC waveform records (rdrecord, rdann).
+get_settings
+Loads dataset paths from your config.
+@dataclass RawSignalData
+A small, immutable object that represents any raw signal input in a consistent way.
+
+Fields:
+
+signal_type: string like "ECG" or "PPG".
+source: where it came from (MIT_BIH_AF, MIMIC_PPG, SIMULATED, etc.).
+values: numpy array of signal values.
+sampling_rate: numeric sampling frequency.
+timestamps: array of timestamps aligned to the samples.
+patient_id, session_id: optional identifiers.
+labels: optional list of labels (like "AFIB").
+class IngestionService
+This class groups all the ways you ingest signals.
+
+__init__
+Loads settings once and stores them in _settings.
+
+load_mitbih(record_id, lead=0)
+Reads MIT‑BIH AFDB data.
+
+Steps:
+
+Build path from settings.afdb_dir / record_id.
+Read waveform using wfdb.rdrecord.
+Pick a lead (column) from p_signal.
+Build timestamps from index / sampling rate.
+Try to read annotations (rdann).
+Normalize any label "AFIB" to "AFIB" (kept consistent).
+Return a RawSignalData object.
+load_mimic(record_id, lead=0)
+Same logic as MIT‑BIH, but uses dataset root path:
+datasets_root / cardiac/mimic_perform_af.
+
+It’s still waveform + annotations, returned as RawSignalData.
+
+load_csv(file_bytes, signal_type, sample_rate, column)
+Reads uploaded CSVs.
+
+Steps:
+
+Read CSV from bytes with pandas.
+Pick a column (by index or name).
+Force numeric type.
+Interpolate missing values linearly.
+Convert to numpy array.
+Build timestamps from sample rate.
+Return RawSignalData.
+load_simulated(signal_type, duration_seconds, scenario)
+Generates synthetic data.
+
+Steps:
+
+Decide sampling rate: 250 Hz for ECG, 125 Hz for PPG.
+Build time array.
+If scenario is "afib":
+Add random phase jitter to simulate irregular rhythm.
+Else: use clean sinus rhythm.
+Add small noise.
+Return RawSignalData with labels like ["AFIB"] or ["SINUS"].
+Dependencies added
+In backend/requirements.txt:
+
+pandas
+wfdb
+
+
+You’ve got a good spec here; the loader is a simple but important integration point. I implemented backend/app/services/dataset_loader.py exactly to that structure and added the small dependencies it needs. Below is a plain‑language, detailed explanation of every part.
+
+What I implemented
+backend/app/services/dataset_loader.py
+Added soundfile and pillow to backend/requirements.txt (for audio/image loading)
+Simple, detailed explanation of the code
+Imports
+dataclass, Path, Any: structure for sample mappings and paths.
+numpy: arrays for signals and images.
+soundfile: reads WAV audio into numpy arrays.
+wfdb: reads physiologic signal records (rdrecord).
+PIL.Image: loads images.
+get_settings: fetches the configured datasets root.
+RawSignalData: shared signal container from ingestion.
+ScenarioSamples dataclass
+A tiny container for one scenario’s dataset paths:
+
+ppg: signal path
+face: image path
+voice: audio path
+DatasetLoader.__init__
+Reads datasets_root from config (unless explicitly provided).
+Defines the exact samples mapping from your screenshot:
+normal, afib_only, palsy_only, dysarthria_only, pre_tia.
+get_ppg(scenario, lead=0)
+Looks up the scenario paths.
+Resolves the PPG signal file.
+Loads it with wfdb.rdrecord.
+Picks the desired lead.
+Builds timestamps using the sampling rate.
+Returns a RawSignalData object.
+get_face_image(scenario)
+Resolves the face image path.
+Opens it with PIL.
+Converts to RGB and returns a numpy array.
+get_voice_audio(scenario)
+Resolves the voice path.
+Reads audio + sample rate with soundfile.read.
+Converts audio to float32.
+Returns (audio_array, sample_rate).
+get_all_for_scenario(scenario)
+Returns all three modalities at once:
+
+{
+  "ppg": RawSignalData(...),
+  "face": np.ndarray,
+  "voice": (audio_array, sr)
+}
+_get_scenario(scenario)
+Validates the scenario name.
+Gives a clear error if the scenario doesn’t exist.
+_resolve(relative_path)
+Builds an absolute path from datasets_root.
+Errors if the path doesn’t exist so missing data fails loudly.
+Notes about accuracy
+I used the exact path structure from your spec.
+The loader will error if those files don’t exist at the configured datasets_root. That’s intentional so missing datasets are obvious.
+If you want, I can also add line‑by‑line comments inside dataset_loader.py like we did for other files.
+I implemented backend/app/ml/cnn_model.py exactly per your spec and added the required dependencies (tensorflow, scikit-learn) to backend/requirements.txt. Below is a simple, line‑by‑line explanation of what each part does, and how the logic matches the requirements.
+
+File: backend/app/ml/cnn_model.py — simple, detailed explanation
+Imports
+dataclass, Path, Any: used for clean structured return types and file paths.
+numpy: for numeric arrays and vectorized operations.
+sklearn.metrics: for precision, recall, F1, AUC, and confusion matrix.
+tensorflow.keras: for the CNN layers, model, training callbacks, and optimizer.
+PredictionResult dataclass
+This is the output of predict_single. It contains:
+
+afib_probability: number from 0–1.
+prediction: "AFIB" or "NORMAL".
+confidence: distance from 0.5.
+uncertain: True if probability is in the 0.35–0.65 range.
+class AFibCNN
+Encapsulates the CNN model and all operations.
+
+__init__
+Starts with self.model = None so we can build lazily.
+
+build(input_shape)
+Creates and compiles the CNN.
+
+Architecture exactly as in your diagram:
+
+Input (window_samples, 1)
+Conv1D(32, kernel=50, relu)
+Conv1D(32, kernel=25, relu)
+Conv1D(64, kernel=10, relu)
+Conv1D(64, kernel=5, relu)
+GlobalAveragePooling1D
+Dense(64, relu)
+Dropout(0.3)
+Dense(1, sigmoid)
+Compile:
+
+binary_crossentropy loss
+Adam optimizer
+metrics: accuracy, precision, recall, AUC
+train(...)
+Trains the model with proper callbacks:
+
+EarlyStopping on val_auc, patience=10
+ReduceLROnPlateau, factor=0.5, patience=5
+optional ModelCheckpoint (saves best weights)
+Returns the training history.
+
+evaluate(X_test, y_test)
+Runs predict to get probabilities.
+Converts to class labels using 0.5 threshold.
+Calculates:
+accuracy
+precision
+recall
+F1
+AUC
+confusion matrix
+Finds uncertain predictions in 0.35–0.65 range.
+Counts false negatives (critical for medical).
+Returns all of these in a dict.
+
+predict(X)
+Ensures model is built.
+Ensures input is shape (N, window_samples, 1).
+Returns probabilities as a flat array (N,).
+predict_single(segment)
+Wraps a single segment into batch form.
+Returns PredictionResult with probability, label, confidence, uncertain flag.
+save(path) / load(path, input_shape)
+Save and load weights only.
+load rebuilds first to match shape.
+load_ecg_weights_for_ppg(...)
+Implements transfer learning:
+
+Builds model with new input shape.
+Loads ECG weights.
+Freezes all Conv1D layers.
+Recompiles with smaller learning rate (1e-4) for fine‑tuning.
+_ensure_model, _ensure_built, _ensure_3d
+Safety helpers:
+
+_ensure_model: fail fast if model isn’t built.
+_ensure_built: build lazily using data shape.
+_ensure_3d: ensures (N, window_samples, 1) input format.
+Dependency updates
+backend/requirements.txt now includes:
+
+tensorflow>=2.15,<3.0
+scikit-learn>=1.3,<2.0
+File: backend/app/ml/train_cnn.py
+Imports
+Path, Tuple for file paths and type hints.
+numpy for array operations.
+train_test_split for a clean 70/15/15 split.
+get_settings to locate weights/.
+AFibCNN for the model.
+IngestionService and SegmentationService for loading and windowing signals.
+_split_data(...)
+Splits data into 70% train, 15% validation, 15% test using two train_test_split calls.
+Uses stratify=y so class balance is preserved.
+
+train_ecg_model()
+Creates weights/ under the project root.
+Loads MIT‑BIH AF records from the IDs already present.
+Segments into windows using SegmentationService.
+Builds X (CNN inputs) and y (AFIB vs NORMAL labels).
+Splits into train/val/test.
+Builds and trains the CNN.
+Saves weights to weights/afib_cnn_ecg.keras.
+Evaluates on the test set and prints metrics.
+train_ppg_transfer()
+Same pipeline but uses load_mimic (PPG).
+Loads ECG weights and freezes convolution layers.
+Fine‑tunes classifier head.
+Saves to weights/afib_cnn_ppg.keras.
+Evaluates and prints metrics.
+if __name__ == "__main__":
+Runs both ECG training and PPG transfer learning in order.
+
+File: backend/app/ml/train_isolation_forest.py
+Imports
+joblib to save models/scalers to disk.
+IsolationForest and StandardScaler.
+get_settings for output path.
+_fit_and_save(...)
+Scales features with StandardScaler.
+Trains IsolationForest(n_estimators=200, contamination=0.1).
+Saves model and scaler to:
+weights/isolation_forest/{stream}_prior.pkl
+weights/isolation_forest/{stream}_scaler.pkl
+train_isolation_forests()
+Creates weights/.
+Uses placeholder random data for now (since real feature extraction isn’t wired).
+Trains and saves for:
+facial
+dysarthria
+parkinsons
+if __name__ == "__main__":
+Runs the training function.
+
+Dependency update
+Added joblib to backend/requirements.txt for model saving.
+
+evaluate.py — simple explanation of every line and step
+Imports
+json, dataclass, Path, Any: used for structured results and writing files.
+numpy: arrays and math.
+roc_curve, auc, confusion_matrix: model evaluation metrics.
+get_settings: gives project_root for weights/reports.
+AFibCNN: CNN model class.
+IngestionService, SegmentationService: load and segment signals.
+EvaluationResult dataclass
+Holds everything from one evaluation run:
+
+name: name of the model.
+metrics: dictionary of numeric metrics.
+roc_curve: fpr, tpr, thresholds arrays.
+confusion: confusion matrix.
+failure_cases: list of misclassified samples.
+_ensure_reports_dir(project_root)
+Creates a reports/ folder and returns its path.
+
+_save_json(path, payload)
+Writes a JSON file to disk.
+
+_collect_cardiac_test_set()
+Uses IngestionService to load MIT‑BIH records.
+Uses SegmentationService to produce windows.
+Converts labels to binary (AFIB → 1, else 0).
+Concatenates all windows into X and labels into y.
+Returns (X, y).
+evaluate_cardiac_model()
+Finds weights at weights/afib_cnn_ecg.keras.
+Loads test set using _collect_cardiac_test_set().
+Builds and loads the model.
+Computes predictions and probabilities.
+Builds ROC curve and AUC.
+Builds confusion matrix.
+Collects misclassified samples (failure cases).
+Returns EvaluationResult.
+evaluate()
+Creates reports/.
+Runs cardiac evaluation.
+Writes:
+cardiac_metrics.json
+cardiac_confusion.json
+cardiac_roc.json
+cardiac_failures.json
+If any error occurs, writes cardiac_error.json.
+if __name__ == "__main__"
+Runs evaluation and prints metrics to terminal.
+
+What’s missing (by design)
+The spec mentions all modalities; only cardiac is wired because other modality test sets and feature extractors aren’t implemented yet. Once you add those datasets or feature pipelines, I can extend this evaluator to:
+
+facial
+dysarthria
+parkinsons
+with ROC, confusion matrices, and failure cases the same way.
+I implemented Option B: feature extraction from raw datasets and evaluation for non‑cardiac modalities in backend/app/ml/evaluate.py. This now:
+
+Loads and evaluates cardiac CNN (as before).
+Extracts dysarthria features from TORGO WAV files and evaluates with IsolationForest.
+Attempts Parkinsons evaluation from datasets/speech/uci_parkinsons/parkinsons.csv (will error if empty or missing).
+Writes ROC, confusion matrices, metrics, and failure cases into reports/.
+Below is a simple, line‑by‑line explanation of the changes, then the current limits.
+
+evaluate.py — simple explanation of new parts
+New imports
+IsolationForest, StandardScaler: for unsupervised anomaly detection evaluation.
+soundfile is used inside helper functions (imported lazily).
+_extract_audio_features(samples, sr)
+Extracts 10 simple features:
+
+mean, std, rms, zcr (time‑domain)
+centroid, spread, rolloff (frequency‑domain)
+max, min, range (signal shape)
+This keeps it lightweight and avoids heavy libraries like librosa.
+
+_collect_dysarthria_dataset()
+Reads all .wav files under:
+datasets/speech/torgo/controls → label 0
+datasets/speech/torgo/dysarthric → label 1
+Extracts features with _extract_audio_features.
+Returns X, y, and file paths.
+_collect_parkinsons_dataset()
+Loads datasets/speech/uci_parkinsons/parkinsons.csv.
+Requires a status column (label).
+Drops name if present.
+Returns features and labels.
+If the CSV is empty, it raises a clear error.
+
+_evaluate_isolation_forest(...)
+Scales features.
+Trains IsolationForest on control samples only (label=0).
+Scores all samples with decision_function.
+Computes ROC curve + AUC.
+Builds a confusion matrix using a 90th percentile threshold.
+Records failure cases (misclassified indices).
+Saves metrics + confusion + ROC + failures to reports/.
+evaluate()
+Now runs:
+
+Cardiac evaluation (CNN).
+Dysarthria evaluation (TORGO + IsolationForest).
+Parkinsons evaluation (if CSV exists).
+Failures for any modality are saved as *_error.json.
+
+Updated evaluate.py to use parkinsons_updrs.data and binarize labels by median total_UPDRS (option 1). This makes ROC/confusion valid.
+
+What changed
+
+Reads datasets/speech/uci_parkinsons/parkinsons_updrs.data.
+Builds labels as:
+1 if total_UPDRS >= median, else 0.
+Features are all columns except subject# and total_UPDRS.
+What I added to evaluate.py
+1. _parse_pts_file(path)
+Reads a .pts file line by line:
+
+Splits each line into x y coordinates.
+Skips empty or malformed lines.
+Returns a numpy array of shape (N, 2).
+2. _extract_facial_features(points)
+Turns the landmark coordinates into a small numeric feature vector:
+
+mean_x, mean_y → center of the face.
+std_x, std_y → spread of landmarks.
+width, height → bounding box size.
+aspect → width / height ratio.
+symmetry → rough left/right balance around median x.
+If no points exist, returns zeros.
+
+3. _collect_facial_dataset()
+Looks under datasets/facial/facial_palsy_db/AFLFP.
+Reads all .pts files.
+Extracts features for each file.
+Returns features and paths.
+4. _evaluate_unsupervised(...)
+Scales features.
+Trains IsolationForest on all samples.
+Computes anomaly scores.
+Picks the top 50 highest‑score samples as “failure cases.”
+Saves:
+{name}_metrics.json
+{name}_scores.json
+{name}_failures.json
+5. In evaluate()
+Adds a new block:
+
+Runs AFLFP evaluation.
+Saves results to reports/.
+If anything fails, writes facial_error.json.
+Output files (new)
+reports/facial_aflfp_if_metrics.json
+reports/facial_aflfp_if_scores.json
+reports/facial_aflfp_if_failures.json
+
+1) AFib CNN (ECG + transfer‑learn PPG)
+Run from the backend folder:
+
+cd C:\Users\dell\Desktop\fyp\real_fyp\stroke-shield\backend
+python -m app.ml.train_cnn
+This will:
+
+Load MIT‑BIH AF records (ECG)
+Segment into windows
+Train ECG CNN
+Save weights to C:\Users\dell\Desktop\fyp\real_fyp\stroke-shield\backend\weights\afib_cnn_ecg.keras
+Run transfer learning on MIMIC PPG
+Save weights to .../weights/afib_cnn_ppg.keras
+If you get ModuleNotFoundError, use the same interpreter where deps were installed:
+
+C:\Python313\python.exe -m app.ml.train_cnn
+2) Isolation Forests (dysarthria + parkinsons + facial unsupervised)
+cd C:\Users\dell\Desktop\fyp\real_fyp\stroke-shield\backend
+python -m app.ml.train_isolation_forest
+This saves:
+
+weights/isolation_forest/dysarthria_prior.pkl
+weights/isolation_forest/parkinsons_prior.pkl
+and their scalers.
+3) Evaluate everything
+cd C:\Users\dell\Desktop\fyp\real_fyp\stroke-shield\backend
+python -m app.ml.evaluate
+Outputs to C:\Users\dell\Desktop\fyp\real_fyp\stroke-shield\backend\reports.
+
+If you want, I can run these commands for you now.
+Short answer: it will train, but “accuracy” isn’t guaranteed, because the data pipeline is minimal and the labels are coarse.
+
+Concrete reasons:
+
+Labels are weak: MIT‑BIH labels in this script are taken from annotations, but we map any non‑AFIB label to 0. That loses granularity and can mislabel segments.
+Very small dataset: only four records are used. That’s not enough for a reliable CNN.
+Segment quality filter: windows below quality 0.4 are dropped; you might end up with very few training samples.
+PPG transfer: uses the same small record list and no true PPG labels.
+So the model will train and output metrics, but you should expect unstable or low accuracy unless you expand the dataset and improve labeling.
+
+If you want it to train for real performance, I can:
+
+Load more records from AFDB and MIMIC.
+Build label arrays aligned to annotations per sample.
+Stratify by record, not just by segment, to avoid leakage.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Front end
+File: frontend/src/types/index.ts
+// Shared types for the frontend app.
+A plain comment that says this file is the central place for reusable TypeScript types.
+
+export type AlertTier = "NORMAL" | "ADVISORY" | "CRITICAL";
+Defines an “enum‑like” type for alert severity. Only these three strings are valid.
+
+export interface FusionResult { ... }
+Describes the combined risk output:
+
+riskScore: number 0–100
+alertTier: one of "NORMAL" | "ADVISORY" | "CRITICAL"
+confidence: 0–1 probability‑like confidence
+contributingFactors: a dictionary of feature names to numeric impact
+recommendation: text message for the user
+export interface CardiacResult { ... }
+Describes the cardiac model output:
+
+afibProbability: 0–1 probability
+prediction: "AFIB" or "NORMAL"
+confidence: distance from decision boundary
+signalQuality: numeric quality score
+export interface NeuroResult { ... }
+Describes neurological results:
+
+faceScore: numeric face risk
+voiceScore: numeric voice risk
+baselineProgress: numeric indicator of progress
+export interface DemoStage { ... }
+Used for demo flow:
+
+stage: only 0–4 are allowed
+values: map of values in that stage
+fusionResult: includes the final combined score
+API request/response interfaces
+SignalUploadRequest
+Represents metadata when uploading a signal:
+
+signalType, signalSource: required strings
+filename, sampleRateHz, durationSeconds, metadata: optional
+SegmentSchema
+Represents a signal segment:
+
+optional HRV metrics
+required samples array
+FilteredSignalResponse
+Represents filtered signal output:
+
+type + source
+filteredSamples array
+optional segment metrics
+optional metadata
+SignalStatusResponse
+Represents backend status:
+
+status, optional message
+timestamp as a string (e.g., ISO time)
+Face models
+FaceFeatures: map of asymmetry scores
+FaceAnalysisResult: features + aggregated score
+Voice models
+DysarthriaFeatures: map of TORGO features
+ParkinsonsFeatures: map of UCI features
+VoiceFeatures: optional dysarthria/parkinsons maps
+VoiceAnalysisResult: features + overall scores
+Anomaly models
+AnomalyResult: score, confidence, and contributing feature weights
+
+You’re still on the Vite starter App.tsx. There’s no app logic yet, so the only accurate “implementation” is to explain what’s already here. If you want me to replace this with your actual UI (dashboard, cards, charts, etc.), tell me what screen you want first.
+
+Here’s a simple, line‑by‑line explanation of the current file:
+
+Imports
+
+useState from React: lets the component hold a counter value.
+reactLogo, viteLogo, heroImg: images used in the UI.
+./App.css: styles for this component.
+function App()
+
+Defines a React function component.
+const [count, setCount] = useState(0)
+
+count starts at 0.
+setCount updates it.
+return (...)
+
+Returns JSX (the UI layout).
+<section id="center">
+
+Main hero section.
+<div className="hero">
+
+Contains stacked images (hero + logos).
+<h1> / <p>
+
+Basic instructions text.
+<button onClick=...>
+
+Increments count by 1 each click.
+Displays “Count is X”.
+<div className="ticks"></div>
+
+Decorative divider (styled via CSS).
+<section id="next-steps">
+
+Contains two cards: “Documentation” and “Connect with us”.
+Each <a> link
+
+Opens a resource in a new tab.
+Final <div className="ticks"> + <section id="spacer">
+
+More layout/spacing.
+export default App
+
+Makes this component available to main.tsx.
+If you want me to implement a real app page here, say the exact screen to build next (e.g., dashboard, upload page, fusion results), and I’ll replace this starter layout.
+c:\Users\dell\Desktop\fyp\real_fyp\stroke-shield\frontend\src\utils\constants.ts
+c:\Users\dell\Desktop\fyp\real_fyp\stroke-shield\frontend\src\index.css
+constants.ts — simple, line‑by‑line explanation
+API_BASE_URL: uses VITE_API_BASE_URL if set, otherwise defaults to http://localhost:8000.
+ALERT_TIER_COLORS: maps alert tiers to the exact hex colors you provided.
+CHART_COLORS: a palette for charts.
+DEFAULT_THRESHOLDS: default decision thresholds for AFib, uncertainty, advisory, and critical risk.
+index.css — simple, line‑by‑line explanation
+@import ...: loads Syne, DM Sans, and DM Mono from Google Fonts.
+:root variables:
+Base colors, surface colors, text colors.
+Alert tier colors matching constants.
+Chart colors matching constants.
+Shadow tokens.
+Font families for display, body, and mono.
+Global font and rendering settings.
+@keyframes heartbeat: a subtle scale pulse for heartbeat‑style effects.
+@keyframes pulse-ring: expanding ring used for attention highlights.
+@keyframes scan-line: a vertical sweep animation for a scanning effect.
+@keyframes critical-flash: red glow pulse for critical alerts.
+Global box-sizing so layout sizing is predictable.
+body:
+Zero margin.
+A soft layered gradient background.
+#root: takes full viewport height.
+Typography styles for headings and paragraphs.
+code: uses mono font with a light background.
+If you want me to align component styles to these tokens (buttons, cards, charts), say which screen we’re building first.
+
+Added frontend/src/store/index.ts and set up a correct Redux Toolkit store scaffold. Because there are no slice files yet, the reducer map is intentionally empty and ready for you to plug slices in.
+
+File created
+
+c:\Users\dell\Desktop\fyp\real_fyp\stroke-shield\frontend\src\store\index.ts
+Simple explanation (every line/step)
+
+import { configureStore } from "@reduxjs/toolkit";
+Pulls in the Redux Toolkit function used to create the store.
+
+The comment block:
+Shows where to import slice reducers when they exist.
+
+export const store = configureStore({ reducer: { ... } });
+Creates the Redux store.
+Right now the reducer map is empty because there are no slices yet.
+As soon as you add a slice, you’ll add it into this object.
+
+export type RootState = ReturnType<typeof store.getState>;
+Exports the TypeScript type for the entire store state.
+
+export type AppDispatch = typeof store.dispatch;
+Exports the type of the dispatch function for typed hooks.
+
+If you want, I can create the first slice (e.g., demoSlice, fusionSlice, or cardiacSlice) and wire it into this store next.
+mplemented fusionSlice and wired it into the store.
+
+Files updated
+
+c:\Users\dell\Desktop\fyp\real_fyp\stroke-shield\frontend\src\store\slices\fusionSlice.ts
+c:\Users\dell\Desktop\fyp\real_fyp\stroke-shield\frontend\src\store\index.ts
+Simple explanation of fusionSlice.ts
+
+import { createSlice, PayloadAction } from "@reduxjs/toolkit";
+Brings in Redux Toolkit helpers for slice creation and typed actions.
+
+import type { AlertTier, FusionResult } from "../../types";
+Reuses shared types to keep state and payloads consistent.
+
+export interface FusionState { ... }
+Defines the shape of fusion state: risk score, alert tier, confidence, contributing factors, recommendation, history, trend.
+
+const initialState
+Default values when the app starts or resetFusion is called.
+
+createSlice({ name, initialState, reducers })
+Creates Redux actions + reducer.
+
+Reducers:
+
+setFusionResult: updates all fusion fields from the payload.
+
+addToHistory: pushes a new score and keeps only the latest 20.
+
+setTrend: updates trend value.
+
+resetFusion: resets to initialState.
+
+export const { ... } = fusionSlice.actions;
+Exports action creators for use in UI code.
+
+export default fusionSlice.reducer;
+Exports the reducer for the store.
+
+Store update
+
+Import fusionReducer.
+Add it under the fusion key.
+If you want me to add selectors or hook helpers next, say the word.
+
+Added the cardiac slice and wired it into the Redux store.
+
+Files updated
+
+c:\Users\dell\Desktop\fyp\real_fyp\stroke-shield\frontend\src\store\slices\cardiacSlice.ts
+c:\Users\dell\Desktop\fyp\real_fyp\stroke-shield\frontend\src\store\index.ts
+Simple explanation of cardiacSlice.ts
+
+createSlice and PayloadAction give us reducers + typed actions.
+CardiacResult keeps payloads aligned with your shared types.
+CardiacState defines:
+afibProbability, prediction, confidence, signalQuality
+waveform for raw PPG/ECG arrays
+isProcessing loading flag
+initialState sets safe defaults.
+Reducers:
+setCardiacResult: updates the four core result fields.
+setWaveform: updates waveform array.
+setProcessing: toggles loading state.
+resetCardiac: returns initial state.
+Store now includes cardiac and fusion.
+Added neuroSlice and wired it into the store.
+
+Files updated
+
+c:\Users\dell\Desktop\fyp\real_fyp\stroke-shield\frontend\src\store\slices\neuroSlice.ts
+c:\Users\dell\Desktop\fyp\real_fyp\stroke-shield\frontend\src\store\index.ts
+Simple explanation of neuroSlice.ts
+
+BaselineProgress holds counts for face and voice baseline captures.
+NeuroState includes:
+faceScore, voiceScore, dysarthriaScore, parkinsonsScore
+baselineProgress (counts by stream)
+isCapturing boolean
+initialState sets all numbers to 0 and isCapturing to false.
+Reducers:
+setNeuroResults: updates multiple neuro values at once (partial updates allowed).
+updateBaselineProgress: increments face or voice count.
+setCapturing: toggles camera/mic active state.
+resetNeuro: returns to initialState
+Simple explanation of demoSlice.ts
+
+DemoStage type is restricted to 0–4.
+DemoState includes:
+currentStage (0–4)
+isPlaying (autoplay on/off)
+scenario (string like "pre_tia")
+stageData (values for the current stage)
+initialState sets stage 0, not playing, default scenario, empty data.
+Reducers:
+setStage: set stage directly.
+setPlaying: start/stop autoplay.
+setScenario: change scenario string.
+nextStage: increment with wrap 0–4.
+setStageData: replace values for current stage.
+resetDemo: return to initial state.
+If you want me to add selectors or typed hooks next, say the word.
+
+signalApi.ts — simple, line‑by‑line explanation
+import axios from "axios";
+Brings in Axios for HTTP requests.
+
+import type { CardiacResult } from "../types";
+Reuses the shared type for cardiac responses.
+
+import { API_BASE_URL } from "../utils/constants";
+Base URL for the backend, so you don’t hardcode it.
+
+const api = axios.create({ baseURL: API_BASE_URL });
+Creates a reusable Axios instance with the base URL.
+
+getRecords()
+api.get("/api/cardiac/records")
+Calls the backend to get a list of available record IDs.
+Returns the array of strings.
+uploadPPG(file)
+Creates FormData and appends the file under "file".
+POST /api/cardiac/upload with multipart form data.
+Returns CardiacResult.
+loadMITBIH(recordId)
+POST /api/cardiac/mitbih/{recordId}
+Returns CardiacResult.
+loadMIMIC(recordId)
+POST /api/cardiac/mimic/{recordId}
+Returns CardiacResult.
+simulatePPG(scenario)
+POST /api/cardiac/simulate with { scenario } in JSON body.
+Returns CardiacResult.
+neurologicalApi.ts — simple, line‑by‑line explanation
+import axios from "axios";
+Axios is used for HTTP requests.
+
+import { API_BASE_URL } from "../utils/constants";
+Base URL for the backend.
+
+const api = axios.create({ baseURL: API_BASE_URL });
+Creates a reusable Axios instance.
+
+analyzeFace(imageFile)
+Creates FormData.
+Adds the image file as "file".
+POSTs to /api/neurological/face/analyze.
+Returns response.data.
+analyzeFaceSession(images)
+Creates FormData.
+Adds each image file as "files".
+POSTs to /api/neurological/face/session.
+Returns response.data.
+addFaceBaseline(imageFile)
+Same pattern as analyzeFace, but POSTs to /face/baseline.
+analyzeVoice(audioFile)
+Same pattern, POSTs to /voice/analyze.
+addVoiceBaseline(audioFile)
+Same pattern, POSTs to /voice/baseline.
+runSpeechTest(promptIndex, audioFile)
+Adds prompt_index and file to FormData.
+POSTs to /voice/speech-test.
+Returns response.data.
+getBaselineStatus()
+GET /api/neurological/baseline/status.
+Returns response.data.
+
+neuroTestsApi.ts — simple, line‑by‑line explanation
+import axios from "axios";
+Axios is used to make HTTP requests.
+
+import { API_BASE_URL } from "../utils/constants";
+Pulls the base backend URL from constants.
+
+const api = axios.create({ baseURL: API_BASE_URL });
+Creates a reusable Axios instance so every request shares the same base URL.
+
+sendReactionTime(trials)
+Sends an array of reaction times.
+POST /api/neuro-tests/reaction-time
+Body shape: { trials }
+Returns response.data.
+sendFingerTracking(data)
+Sends tracking metrics.
+POST /api/neuro-tests/finger-tracking
+Body is the raw data object.
+Returns response.data.
+sendCognitiveTest(results)
+Sends cognitive test results.
+POST /api/neuro-tests/cognitive
+Body is the raw results object.
+Returns response.data.
+sendTapSpeed(taps)
+Sends an array of tap intervals or counts.
+POST /api/neuro-tests/tap-speed
+Body shape: { taps }
+Returns response.data.
+getCombinedScore()
+Requests combined score.
+POST /api/neuro-tests/combined
+No body required.
+Returns response.data.
+If you want strict response types instead of any, I can wire them to src/types.
+
+fusionApi.ts — simple, line‑by‑line explanation
+import axios from "axios";
+Axios handles HTTP requests.
+
+import type { FusionResult } from "../types";
+Ensures responses match your shared FusionResult type.
+
+import { API_BASE_URL } from "../utils/constants";
+Uses the configured backend URL.
+
+const api = axios.create({ baseURL: API_BASE_URL });
+Creates a reusable Axios instance with the base URL.
+
+FusionScorePayload
+Defines the input shape for fusion scoring:
+
+cardiacScore, faceScore, voiceScore, dysarthriaScore, parkinsonsScore
+All optional so you can send any combination.
+getFusionScore(data)
+POST /api/fusion/score with the payload.
+Returns a FusionResult.
+getCardiacOnly(afibProbability, cardiacIf?)
+POST /api/fusion/cardiac-only with those two fields.
+Returns a FusionResult.
+getHistory()
+GET /api/fusion/history
+Returns an array of FusionResult.
+resetHistory()
+POST /api/fusion/reset
+No response body expected.
+
+demoApi.ts — simple, line‑by‑line explanation
+import axios from "axios";
+Axios is used for HTTP calls.
+
+import type { DemoStage } from "../types";
+Uses shared type for stage responses.
+
+import { API_BASE_URL } from "../utils/constants";
+Pulls backend URL from constants.
+
+const api = axios.create({ baseURL: API_BASE_URL });
+Creates a reusable Axios instance with the base URL.
+
+startDemo()
+POST /api/demo/start
+No return body expected.
+getStage(stageNumber)
+GET /api/demo/stage/{stageNumber}
+Returns a DemoStage object.
+runFullDemo()
+POST /api/demo/run-full
+No return body expected.
+getScenario(scenarioName)
+GET /api/demo/scenario/{scenarioName}
+Returns raw response data.
+injectToFusion()
+POST /api/demo/inject-to-fusion
+No return body expected.
+Sidebar.tsx — simple, line‑by‑line explanation
+import { useMemo, useState } from "react";
+useState manages open/closed state on mobile.
+useMemo caches the current path.
+
+import { useSelector } from "react-redux";
+Reads current alert tier from Redux.
+
+import type { AlertTier } from "../../types";
+Typed alert tier values.
+
+import type { RootState } from "../../store";
+Typed access to Redux state.
+
+import "./Sidebar.css";
+Loads styling.
+
+type NavLink
+Defines the shape of sidebar links: label, href, optional badge.
+
+NAV_LINKS
+All pages:
+
+Dashboard, Cardiac, Neurological, Neuro Tests, Demo
+Demo includes badge: "FR6".
+resolveTierClass
+Maps the current alert tier to a CSS class:
+
+CRITICAL → red dot
+ADVISORY → amber dot
+default → green dot
+Sidebar() component
+isOpen tracks whether mobile nav is expanded.
+alertTier is read from Redux (fusion.alertTier).
+activePath is pulled from window.location.pathname.
+JSX layout
+<aside className="sidebar">
+Container for the nav.
+
+Header contains:
+
+The colored alert dot + title.
+Toggle button for mobile (Menu/Close).
+<nav> renders all links:
+
+Each link compares its href to the current path to add .active.
+Demo link shows a “FR6” badge.
+Sidebar.css — simple explanation
+Layout styles for sidebar width, spacing, borders.
+.sidebar-link.active highlights current page.
+.sidebar-dot.* uses the alert tier colors defined in CSS variables.
+Mobile behavior (max-width: 900px):
+Hide nav by default.
+Show it when sidebar open class is set.
+Navbar.tsx — simple, line‑by‑line explanation
+import { useMemo } from "react";
+Memoizes computed status text.
+
+import { useSelector } from "react-redux";
+Reads values from Redux.
+
+import type { RootState } from "../../store";
+Types for useSelector.
+
+import "./Navbar.css";
+Styles for the navbar.
+
+NavbarProps
+isAuthenticated?: boolean
+userName?: string
+Optional props so you can show a user menu if logged in.
+resolveTierLabel
+Normalizes the alert tier string so it always shows in uppercase.
+
+Navbar component
+Reads:
+fusion.alertTier for the overall risk tier.
+cardiac.isProcessing for current processing status.
+demo.currentStage for quick demo stage info.
+statusLabel is "Processing" or "Idle" based on the flag.
+JSX layout
+Left: app title + dot logo.
+Center: quick status pills for Fusion, Cardiac, Demo.
+Right: user menu button (shows name if authenticated, else “Guest”).
+Navbar.css — simple explanation
+Defines layout, spacing, and borders.
+.logo-dot uses the normal alert color as the logo indicator.
+.status-pill gives small rounded status tags.
+.user-button styles the user menu.
+Responsive mode stacks the navbar on small screens.
+RiskGauge.tsx — simple, line‑by‑line explanation
+import { useMemo } from "react";
+Memoizes derived values (needle rotation).
+
+import { motion } from "framer-motion";
+Enables smooth animation of the gauge.
+
+import type { AlertTier } from "../../types";
+Typed alert tier values.
+
+import "./RiskGauge.css";
+Styles for the gauge.
+
+RiskGaugeProps
+value: risk score (0–100).
+alertTier: optional alert tier for pulse effect.
+clamp(...)
+Keeps the score between 0 and 100.
+
+describeColor(...)
+Maps score to color:
+
+0–34 → green
+35–74 → amber
+75–100 → red
+RiskGauge(...)
+normalized: clamped score.
+arcLength: stroke length for the gauge arc.
+progress: how much of the arc to show.
+needleRotation: computed from score (-130° to +130°).
+strokeColor: color based on score.
+JSX
+<svg> draws a semicircle arc.
+risk-gauge-track: background arc.
+motion.path: animated fill arc (Framer Motion).
+motion.line: animated needle (Framer Motion).
+Center circle: visual pivot.
+Value display shows score and label.
+pulse class is added when alertTier === "CRITICAL".
+RiskGauge.css — simple explanation
+.risk-gauge: card container styling.
+.risk-gauge-track: gray arc background.
+.risk-gauge-fill: animated arc.
+.risk-gauge-needle: needle styling.
+.risk-gauge-center: pivot dot.
+.risk-gauge.pulse: uses critical-flash keyframe from index.css.
+StreamBar.tsx — simple, line‑by‑line explanation
+import { memo } from "react";
+memo prevents unnecessary re-renders.
+
+import "./StreamBar.css";
+Loads styles.
+
+Props
+name: label for the stream (e.g., “Cardiac CNN”).
+score: numeric value 0–1.
+layout: "stacked" or "inline".
+clamp(...)
+Ensures score stays between 0 and 1.
+
+scoreToClass(...)
+Maps score to color class:
+
+<0.35 → green
+0.35–0.74 → amber
+>=0.75 → red
+StreamBar(...)
+normalized: clamped score.
+fillClass: CSS class for color.
+percent: score converted to percent.
+Renders:
+
+A label row with name and %.
+A bar track with a colored fill whose width equals the percent.
+StreamBar.css — simple explanation
+.stream-bar: grid container.
+.inline: places label and bar side‑by‑side.
+.stream-bar-track: background track.
+.bar-fill: colored fill that grows with score.
+.normal, .advisory, .critical: color tiers.
+TrendChart.tsx — simple, line‑by‑line explanation
+Imports Recharts components for the line chart.
+TrendPoint type: { time, riskScore }.
+formatData(...): keeps only the last 10 entries and adds an index.
+TrendChart component:
+chartData memoized from input.
+Renders a header + chart body.
+LineChart uses:
+XAxis → time
+YAxis → 0–100
+Gradient stroke (green→amber→red).
+Tooltip shows exact values.
+Line uses riskScore.
+TrendChart.css — simple explanation
+Card styling to match the rest of the UI.
+Header typography.
+Body ensures chart fills space.
+AlertPanel.tsx — simple, line‑by‑line explanation
+Imports AlertTier for typing.
+Imports ALERT_TIER_COLORS to color the panel by tier.
+Imports stylesheet.
+Props
+alertTier: current risk tier.
+recommendation: plain language guidance.
+contributingFactors: map of factor → score.
+Helpers
+tierIcon: maps tier to a symbol.
+tierLabel: maps tier to readable label.
+factorLabel: converts snake_case to words.
+Component
+backgroundColor is derived from tier.
+Header shows icon + “Critical/Advisory/Normal Alert”.
+Body uses tier color for background and renders:
+Recommendation
+Bullet list of factors, shown as percentages.
+Footer shows action buttons (placeholders).
+AlertPanel.css — simple explanation
+.alert-panel: card container.
+.alert-header: left border uses tier color.
+.alert-icon: big rounded icon holder.
+.alert-body: colored panel area.
+.alert-factors: bullet list spacing.
+.alert-actions: responsive button layout.
+Button styles: primary, secondary, ghost.
+AlertModal.tsx — simple, line‑by‑line explanation
+useEffect, useState: manage modal open state and acknowledgement.
+AlertTier type: ensures valid tier values.
+Props:
+alertTier: current tier.
+recommendation: message to show.
+onAcknowledge: optional callback.
+State
+isOpen: whether the modal is visible.
+hasAcknowledged: prevents reopening until page refresh.
+useEffect
+If tier becomes CRITICAL and not acknowledged, open the modal.
+
+handleAcknowledge
+Closes modal, marks acknowledged, calls callback.
+
+Render
+If isOpen is false → return null.
+Otherwise render:
+“Critical Alert”
+recommendation text
+emergency guidance list
+“I Understand” button
+AlertModal.css — simple explanation
+.alert-modal-backdrop: full‑screen dark overlay.
+.alert-modal: centered card.
+.alert-guidance: red‑tinted warning box.
+.alert-ack: red action button.
+If you want this wired to Redux (fusion alert tier) or placed inside App.tsx, say where you want it rendered.
+PPGUploader.tsx — simple, line‑by‑line explanation
+Imports React hooks (useState, useCallback, useMemo) for state and computed values.
+Imports motion from Framer Motion for the progress bar animation.
+Imports uploadPPG API function.
+Imports stylesheet.
+Types
+ParsedSignal: shape of parsed CSV data (samples, sampleRate).
+Constants
+REQUIRED_HEADERS: value and sample_rate are required in the CSV.
+parseCsv(file)
+Reads CSV text.
+Parses header line and checks for required columns.
+Extracts numeric value and sample_rate per row.
+Collects samples and captures sample rate.
+Throws errors for empty files or invalid data.
+Component state
+file: selected file.
+preview: array of sample values for preview.
+progress: 0–100 for upload progress.
+error: error message (if any).
+isUploading: whether upload is in progress.
+previewData
+Memoized to keep at most the first 200 preview points.
+
+handleFile(selected)
+Resets errors and progress.
+Parses CSV.
+Extracts first ~5 seconds of signal for preview.
+If parsing fails, shows error.
+Drag & drop
+handleDrop picks the first dropped file and passes it to handleFile.
+handleUpload
+Calls uploadPPG(file).
+Updates progress bar.
+Captures errors if upload fails.
+Render
+Dropzone UI + file input.
+Error message if present.
+Signal preview as tiny bars.
+Upload button + progress bar.
+PPGUploader.css — simple explanation
+.ppg-uploader: card container.
+.dropzone: dashed drag‑and‑drop area.
+.file-button: styled file input label.
+.error-text: red text for errors.
+.preview-chart: mini bar chart.
+.upload-actions: button + progress bar styling.
+SignalVisualizer.tsx — simple, line‑by‑line explanation
+Imports React hooks, Recharts components, and CSS.
+Props:
+raw: raw waveform array.
+filtered: optional filtered waveform.
+Helpers
+buildData(...) maps raw (and filtered) arrays into { index, raw, filtered }.
+State
+zoom: controls zoom level (1–5).
+pan: window offset.
+showFiltered: toggles filtered line.
+Computed values
+data: memoized full dataset.
+windowSize: derived from zoom.
+start: clamped pan position.
+windowed: sliced data for current view.
+Render
+Control sliders for zoom and pan.
+Checkbox to show filtered line.
+Recharts LineChart:
+grid background
+no axis ticks (clean look)
+tooltip with values
+raw line in blue
+filtered line in red (if enabled)
+Scan line overlay creates live feel.
+SignalVisualizer.css — simple explanation
+Card styling and spacing.
+Grid background (ECG style).
+Scan line animation uses the scan-line keyframe defined in index.css.
+AFibDetector.tsx — simple, line‑by‑line explanation
+Imports useMemo for derived values.
+Imports CSS.
+Props
+afibProbability: 0–1.
+prediction: "AFIB" or "NORMAL".
+confidence: 0–1.
+signalQuality: 0–1.
+history: previous probabilities.
+Helpers
+clamp: forces values into valid range.
+formatPercent: converts 0–1 to percent string.
+Component logic
+Clamp afibProbability and signalQuality.
+ringOffset: controls ring stroke progress.
+comparison: compares current probability to last history entry.
+Render
+SVG circle ring with progress.
+Label shows “Afib Detected” or “Normal.”
+Confidence and signal quality tiles.
+History bars for last 8 values.
+AFibDetector.css — simple explanation
+Card styling.
+Circular ring design via SVG.
+Labels and score styling.
+Small metric tiles.
+History bar visualization.
+FaceTest.tsx — simple line‑by‑line explanation
+Uses react-webcam for live camera feed.
+Tracks captures and baseline progress in state.
+Shows a dashed oval overlay to guide face position.
+“Capture” button grabs a screenshot and updates progress.
+Shows real‑time feedback text and preview thumbnails.
+Progress bar shows baseline collection count.
+FaceAsymmetryMap.tsx
+Renders an SVG face outline.
+Shows landmark dots if provided.
+Mouth curve deforms based on mouthDroop.
+Colored “hot spots” left/right based on asymmetry scores.
+Shows left/right percentages in a legend.
+VoiceTest.tsx
+Uses react-voice-visualizer-react19 (useVoiceVisualizer + VoiceVisualizer).
+Displays waveform during recording.
+Provides Record / Stop / Analyze buttons.
+Shows a recording level meter based on current audio data.
+Optional speech prompt shown at top.
+BaselineSetup.tsx
+Step‑by‑step wizard with 3 steps.
+Buttons simulate capture for each step.
+Shows progress counts for face, voice, passage.
+Marks completion once all steps have at least one capture.
+Allows redo/reset.
+
+
+
+ReactionTimeTest.tsx — simple explanation
+Uses timers to wait for a random color change.
+User taps when the box is green (“ready”).
+Records reaction time for 5 trials.
+Shows fastest, slowest, average, and grade:
+<300ms → NORMAL
+300–449ms → SLOW
+>=450ms → CRITICAL
+Emits results via onComplete if provided.
+CognitiveTest.tsx — simple explanation
+Generates a random number sequence.
+Displays it for 3 seconds.
+User types it back.
+If correct, span increases by 1.
+Records maxSpan and stops when incorrect.
+Emits maxSpan via onComplete.
+TapSpeedTest.tsx — simple explanation
+Starts a timer for 10 seconds.
+Counts taps and calculates taps/second.
+Computes variability of tap intervals (tremor proxy).
+Emits tap list + rate via onComplete.
+DashboardPage.tsx — simple explanation
+Imports fusion UI components and fusion API functions.
+Uses a default empty FusionResult if nothing is loaded.
+On mount, calls getHistory(); if history exists, it uses the last entry.
+If no history, calls getFusionScore({}).
+Auto-refreshes every 30 seconds.
+Renders:
+AlertPanel at top.
+RiskGauge + TrendChart.
+StreamBar list for each stream.
+Trend chart shows the last 10 risk values.
+CardiacPage.tsx — simple explanation
+Three tabs: Simulate, MIT‑BIH, Upload CSV.
+getRecords() is called when MIT‑BIH tab is active.
+Buttons:
+Simulate Normal / AFib / Pre‑TIA → simulatePPG().
+Load Record → loadMITBIH(recordId).
+Upload CSV → uses PPGUploader.
+SignalVisualizer shows waveform.
+AFibDetector shows probability, confidence, quality, and history.
+Uses a generated waveform placeholder for now, since backend returns no waveform.
+NeurologicalPage.tsx — simple explanation
+Two tabs: Face and Voice.
+Shows BaselineSetup until completed.
+Face tab:
+FaceTest webcam capture with baseline progress.
+FaceAsymmetryMap for asymmetry visualization.
+Voice tab:
+VoiceTest with recorder + analysis button.
+Simple result block.
+NeuroTestsPage.tsx — simple explanation
+Renders 3 tests:
+ReactionTimeTest
+CognitiveTest
+TapSpeedTest
+Computes a combined score from all three.
+“Run All” resets scores for a fresh run.
+DemoPage.tsx — simple explanation
+“Simulate Pre‑TIA” button triggers startDemo().
+Stage indicator (0–4).
+Autoplay toggles stage every 3 seconds.
+SignalVisualizer shows a live waveform.
+StreamBar values update per stage.
+Narrative text updates with stage.
+Previous / Next buttons control stage manually.
+Small update to PPGUploader
+Added onParsed to pass waveform back to CardiacPage.
+Added onUploaded callback for post-upload hooks.
+App.tsx (simple line‑by‑line)
+
+import { BrowserRouter, Route, Routes, useLocation } ... brings in React Router so we can define pages and track the current URL.
+import { AnimatePresence, motion } ... enables animated page transitions.
+import "./App.css"; loads layout styling for the app shell.
+import Sidebar ... Navbar ... brings in the layout components.
+import ...Page lines load each page component.
+function AnimatedRoutes() defines a helper that handles route animations.
+const location = useLocation(); reads the current URL so transitions happen on route change.
+<AnimatePresence mode="wait"> ensures the outgoing page animates out before the new one animates in.
+<motion.div ...> wraps the route content with a fade/slide animation.
+key={location.pathname} makes each URL a distinct animation state.
+initial/animate/exit/transition define the simple fade + slide behavior.
+<Routes location={location}> tells Router to use the tracked location for transitions.
+<Route path="/" ...> sets Dashboard as the home page.
+<Route path="/cardiac" ...> sets the Cardiac page route.
+<Route path="/neurological" ...> sets the Neurological page route.
+<Route path="/neuro-tests" ...> sets the Neuro Tests page route.
+<Route path="/demo" ...> sets the Demo page route.
+function App() defines the root component.
+<BrowserRouter> enables SPA routing.
+<div className="app-shell"> is the main layout container (sidebar + main area).
+<Sidebar /> renders the left nav (always visible on desktop).
+<div className="app-main"> holds the top navbar and current page.
+<Navbar /> renders the top bar.
+<AnimatedRoutes /> renders the current page with transitions.
+export default App makes the component available to main.tsx.
+main.tsx (simple line‑by‑line)
+
+import { StrictMode } ... enables React’s strict checks in dev.
+import { createRoot } ... creates the React 18/19 root.
+import { Provider } ... connects Redux to React.
+import { ThemeProvider } ... enables the MUI theme.
+import "./index.css"; loads global styles and CSS variables.
+import App from "./App"; brings in the main app UI.
+import { store } ... loads the Redux store.
+import { appTheme } ... loads the MUI theme we created.
+createRoot(...).render(...) attaches React to the DOM.
+<StrictMode> wraps the app for dev checks.
+<Provider store={store}> makes Redux state available to all components.
+<ThemeProvider theme={appTheme}> applies the MUI theme globally.
+<App /> renders the app itself.
+theme.ts (simple line‑by‑line)
+
+import { createTheme } ... brings in MUI’s theme builder.
+export const appTheme = createTheme({ ... }) creates and exports your theme.
+palette sets brand colors to match your CSS variables.
+typography sets default fonts, with display headings in Syne.
+shape sets a consistent rounded corner radius.
+App.css (simple line‑by‑line summary)
+
+.app-shell creates a full‑height flex layout.
+.app-main makes the right side a vertical stack (Navbar + page).
+.route-wrapper adds padding around each page and lets it expand.
+@media (max-width: 900px) stacks layout vertically on mobile.
+package.json change
+Added react-router-dom version ^6.26.2 so the routing imports resolve.
+
+If you want, I can also add a tiny NotFound route and a loading boundary. I did not run npm install here, so run it once to pick up react-router-dom.
